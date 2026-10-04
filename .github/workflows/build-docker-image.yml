@@ -1,0 +1,145 @@
+name: Build Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'blender-mcp ref: branch, tag, or 40-char commit SHA'
+        required: false
+        default: main
+        type: string
+  schedule:
+    - cron: '0 6 * * 0'
+
+concurrency:
+  group: build-docker-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY_IMAGE: arcticfox520/blender-mcp
+  UPSTREAM_REPO: ahujasid/blender-mcp
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      short: ${{ steps.head.outputs.short }}
+      latest: ${{ steps.head.outputs.latest }}
+    steps:
+      - id: head
+        env:
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          set -euo pipefail
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            sha="$REF"
+          else
+            out="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" \
+              "$REF" "refs/heads/$REF" "refs/tags/$REF" "refs/tags/$REF^{}")"
+            peeled="$(printf '%s\n' "$out" | awk '/\^\{\}$/ {print $1; exit}')"
+            sha="${peeled:-$(printf '%s\n' "$out" | awk 'NR==1 {print $1}')}"
+          fi
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::cannot resolve ref '$REF' in ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          {
+            echo "sha=$sha"
+            echo "short=${sha:0:7}"
+            if [[ "$REF" == "main" ]]; then echo "latest=true"; else echo "latest=false"; fi
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
+          - { platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=blender-mcp
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.version=sha-${{ needs.resolve.outputs.short }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+          outputs: >-
+            type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=blendermcp-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=blendermcp-${{ matrix.arch }}
+
+      - run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          echo "${{ steps.build.outputs.digest }}" > "$RUNNER_TEMP/digests/${{ matrix.arch }}.digest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*.digest
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - env:
+          SHORT: ${{ needs.resolve.outputs.short }}
+          SET_LATEST: ${{ needs.resolve.outputs.latest }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(ls digests/*.digest 2>/dev/null || true)
+          if (( ${#files[@]} != 2 )); then
+            echo "::error::expected 2 platform digests, got ${#files[@]}"
+            exit 1
+          fi
+          refs=()
+          for f in "${files[@]}"; do refs+=("${REGISTRY_IMAGE}@$(cat "$f")"); done
+          tags=(-t "${REGISTRY_IMAGE}:sha-${SHORT}")
+          if [[ "$SET_LATEST" == "true" ]]; then
+            tags+=(-t "${REGISTRY_IMAGE}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          docker buildx imagetools inspect "${REGISTRY_IMAGE}:sha-${SHORT}"
