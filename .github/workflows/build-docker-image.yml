@@ -114,6 +114,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v4
         with:
           path: digests
@@ -143,3 +145,18 @@ jobs:
           fi
           docker buildx imagetools create "${tags[@]}" "${refs[@]}"
           docker buildx imagetools inspect "${REGISTRY_IMAGE}:sha-${SHORT}"
+
+      - env:
+          USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          jwt="$(jq -n --arg u "$USERNAME" --arg p "$TOKEN" '{username:$u,password:$p}' \
+            | curl -fsS -X POST https://hub.docker.com/v2/users/login/ \
+                -H 'Content-Type: application/json' --data @- \
+            | jq -r .token)"
+          jq -n --rawfile d README.md '{full_description:$d}' \
+            | curl -fsS -X PATCH "https://hub.docker.com/v2/repositories/${REGISTRY_IMAGE}/" \
+                -H "Authorization: JWT ${jwt}" \
+                -H 'Content-Type: application/json' \
+                --data @- > /dev/null
